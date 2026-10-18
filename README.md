@@ -19,11 +19,15 @@ A lightweight macOS menu bar screen recorder built on ScreenCaptureKit (macOS 15
   losslessly into one MP4 when you stop
 - Screenshot mode: capture the screen, a window (even if it's covered) or an area as a Retina PNG.
   In the picker a single click captures the window, popup or part of a window under the pointer.
-  Optional 3/5/10 s delay, saved to a file and/or copied to the clipboard, with a preview
-  thumbnail you can click to open or drag into another app
+  Optional 3/5/10 s delay; saved to a folder you choose (default `~/Pictures/ScreenRecorder`)
+  and/or copied to the clipboard; a thumbnail afterwards that you can drag into another app
+- Annotate in place: right after capture the screenshot stays frozen where it was taken, with a
+  floating toolbar: arrow, rectangle, ellipse, pen, highlighter, text, numbered steps and pixelate
+  (to hide sensitive info), 8 colors, 3 sizes, undo/redo, single-key tool shortcuts
+  (V A R O P H T N B), then Save (Return), Copy (⌘C) or Discard (Esc)
 - Global hotkeys: **⌃⌥⌘R** start/stop, **⌃⌥⌘A** select an area and record, **⌃⌥⌘P** pause/resume,
   **⌃⌥⌘S** screenshot (click a window or drag an area)
-- Recordings are saved to `~/Movies/ScreenRecorder`, screenshots to `~/Pictures/ScreenRecorder`
+- Recordings are saved to `~/Movies/ScreenRecorder`
 
 ## Build & run
 
@@ -57,6 +61,7 @@ After switching identities, reset the old grant once:
 | `Sources/ScreenRecorder/SegmentWriter.swift` | Encodes each segment to HEVC/H.264 + AAC (AVAssetWriter), quality presets |
 | `Sources/ScreenRecorder/SegmentJoiner.swift` | Joins segments and mixes system audio + mic into one track |
 | `Sources/ScreenRecorder/Screenshot.swift` | Saving/copying screenshots and the preview thumbnail |
+| `Sources/ScreenRecorder/Annotator.swift` | In-place screenshot annotation (tools, toolbar, rendering) |
 | `Sources/ScreenRecorder/AreaSelector.swift` | The area / window / element picker |
 | `Sources/ScreenRecorder/HotKey.swift` | Global hotkey (Carbon) |
 | `Resources/Info.plist` | Bundle config (menu bar only, mic usage text) |

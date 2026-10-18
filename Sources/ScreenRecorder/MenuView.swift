@@ -150,7 +150,7 @@ struct MenuView: View {
             }
             .controlSize(.large)
             .buttonStyle(.borderedProminent)
-            .tint(isScreenshotMode ? .accentColor : .red)
+            .tint(recorder.mode.tint)
             .disabled(recorder.isBusy || needsWindow)
             .keyboardShortcut(.defaultAction)
         }
@@ -166,7 +166,35 @@ struct MenuView: View {
                 Text("10 seconds").tag(10)
             }
             .help("Time to open a menu or hover something before the screenshot is taken.")
-            Toggle("Save to Pictures › ScreenRecorder", isOn: $recorder.saveScreenshot)
+            Toggle("Annotate right after capture", isOn: $recorder.annotateAfterCapture)
+                .help("Opens the markup tools on the screenshot, right where you took it. Off: it's saved straight away, and you can click the thumbnail to annotate.")
+            VStack(alignment: .leading, spacing: 4) {
+                Toggle("Save to file", isOn: $recorder.saveScreenshot)
+                if recorder.saveScreenshot {
+                    HStack(spacing: 6) {
+                        Image(systemName: "folder.fill")
+                            .foregroundStyle(.blue)
+                        Text(recorder.screenshotFolderName)
+                            .font(.caption)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                            .help(recorder.screenshotFolder.path)
+                        Spacer(minLength: 4)
+                        if recorder.screenshotFolder != Screenshot.defaultFolder {
+                            Button {
+                                recorder.resetScreenshotFolder()
+                            } label: {
+                                Image(systemName: "arrow.counterclockwise")
+                            }
+                            .buttonStyle(.borderless)
+                            .help("Back to Pictures › ScreenRecorder")
+                        }
+                        Button("Change…") { recorder.chooseScreenshotFolder() }
+                            .controlSize(.small)
+                    }
+                    .padding(.leading, 20)
+                }
+            }
             Toggle("Copy to clipboard", isOn: $recorder.copyScreenshot)
         }
     }
@@ -369,7 +397,7 @@ struct MenuView: View {
 extension CaptureMode {
     var symbol: String { self == .video ? "video.fill" : "camera.viewfinder" }
     var subtitle: String { self == .video ? "Record screen & sound" : "Capture a still image" }
-    var tint: Color { self == .video ? .red : .blue }
+    var tint: Color { self == .video ? .green : .blue }
     var help: String {
         self == .video
             ? "Record a video of your screen, a window or an area"

@@ -29,6 +29,19 @@ enum CaptureMode: String, CaseIterable, Identifiable {
     }
 }
 
+/// Where something was on screen: a rect in global AppKit coordinates and the screen it's on.
+struct ScreenPlacement {
+    var rect: CGRect
+    var screen: NSScreen
+}
+
+/// A screenshot on its way to being annotated, saved or copied.
+struct CapturedShot {
+    var image: CGImage
+    var scale: CGFloat
+    var placement: ScreenPlacement
+}
+
 enum RecorderError: LocalizedError {
     case noDisplay, noWindow, areaDisplayMissing
 
@@ -91,6 +104,12 @@ final class Recorder: NSObject, ObservableObject {
     }
     /// Seconds to wait before capturing, so menus and hover states can be set up.
     @Published var screenshotDelay: Int { didSet { defaults.set(screenshotDelay, forKey: "screenshotDelay") } }
+    /// Open the annotation tools on the screenshot, right where it was taken, before saving it.
+    @Published var annotateAfterCapture: Bool { didSet { defaults.set(annotateAfterCapture, forKey: "annotateAfterCapture") } }
+    /// Where screenshots are saved. Defaults to Pictures › ScreenRecorder.
+    @Published private(set) var screenshotFolder: URL {
+        didSet { defaults.set(screenshotFolder == Screenshot.defaultFolder ? nil : screenshotFolder.path, forKey: "screenshotFolder") }
+    }
     /// Highlight parts of windows (sidebars, toolbars…) in the area picker. Needs Accessibility access.
     @Published var detectElements: Bool {
         didSet {
@@ -135,6 +154,7 @@ final class Recorder: NSObject, ObservableObject {
     private let areaBorder = AreaBorderOverlay()
     private let cameraBubble = CameraBubble()
     private let screenshotPreview = ScreenshotPreview()
+    private let annotationOverlay = AnnotationOverlay()
 
     static let recordingsFolder = FileManager.default
         .urls(for: .moviesDirectory, in: .userDomainMask)[0]
@@ -157,6 +177,7 @@ final class Recorder: NSObject, ObservableObject {
             "saveScreenshot": true,
             "copyScreenshot": true,
             "screenshotDelay": 0,
+            "annotateAfterCapture": true,
         ])
         mode = CaptureMode(rawValue: defaults.string(forKey: "mode") ?? "") ?? .video
         source = CaptureSource(rawValue: defaults.string(forKey: "source") ?? "") ?? .area
@@ -174,6 +195,9 @@ final class Recorder: NSObject, ObservableObject {
         self.saveScreenshot = saveScreenshot
         copyScreenshot = defaults.bool(forKey: "copyScreenshot") || !saveScreenshot
         screenshotDelay = defaults.integer(forKey: "screenshotDelay")
+        annotateAfterCapture = defaults.bool(forKey: "annotateAfterCapture")
+        screenshotFolder = defaults.string(forKey: "screenshotFolder").map { URL(fileURLWithPath: $0, isDirectory: true) }
+            ?? Screenshot.defaultFolder
         selectedArea = Self.loadArea(from: defaults)
         cameraID = defaults.string(forKey: "cameraID")
         bubbleSize = CameraBubble.Size(rawValue: defaults.integer(forKey: "bubbleSize")) ?? .medium
@@ -807,7 +831,7 @@ final class Recorder: NSObject, ObservableObject {
     /// Captures the current source (Screen, Window or Area) as a PNG. `pickArea` always opens the
     /// picker instead, where a click takes a window or part of one and a drag takes any area.
     func takeScreenshot(pickArea: Bool = false) async {
-        guard state == .idle else { return }
+        guard state == .idle, !annotationOverlay.isPresented else { return }
         errorMessage = nil
         guard checkScreenCaptureAccess() else { return }
 
@@ -841,18 +865,28 @@ final class Recorder: NSObject, ObservableObject {
             let filter: SCContentFilter
             let config = SCStreamConfiguration()
             let size: CGSize
+            // Where the shot was on screen (AppKit coordinates), so it can be annotated in place.
+            var placement: ScreenPlacement?
             switch source {
             case .display:
                 guard let display = content.displays.first(where: { $0.displayID == selectedDisplayID })
                     ?? content.displays.first else { throw RecorderError.noDisplay }
                 filter = SCContentFilter(display: display, excludingApplications: ownApps(in: content), exceptingWindows: [])
                 size = filter.contentRect.size
+                placement = Self.screen(for: display.displayID).map { ScreenPlacement(rect: $0.frame, screen: $0) }
             case .window:
                 guard let id = selectedWindowID,
                       let window = content.windows.first(where: { $0.windowID == id }) else { throw RecorderError.noWindow }
                 filter = SCContentFilter(desktopIndependentWindow: window)
                 config.ignoreShadowsSingleWindow = true
                 size = filter.contentRect.size
+                if let mainHeight = NSScreen.screens.first?.frame.height {
+                    // SCWindow frames use top-left-origin global coordinates; AppKit uses bottom-left.
+                    let frame = CGRect(x: window.frame.minX, y: mainHeight - window.frame.maxY,
+                                       width: window.frame.width, height: window.frame.height)
+                    let screen = NSScreen.screens.first { $0.frame.contains(CGPoint(x: frame.midX, y: frame.midY)) } ?? NSScreen.main
+                    placement = screen.map { ScreenPlacement(rect: frame, screen: $0) }
+                }
             case .area:
                 guard let area, let display = content.displays.first(where: { $0.displayID == area.displayID }) else {
                     throw RecorderError.areaDisplayMissing
@@ -861,6 +895,7 @@ final class Recorder: NSObject, ObservableObject {
                 let rect = area.rect.intersection(CGRect(origin: .zero, size: filter.contentRect.size))
                 config.sourceRect = rect
                 size = rect.size
+                placement = Self.screen(for: area.displayID).map { ScreenPlacement(rect: $0.globalRect(fromLocal: rect), screen: $0) }
             }
             let scale = CGFloat(filter.pointPixelScale)
             config.width = Int((size.width * scale).rounded())
@@ -869,26 +904,90 @@ final class Recorder: NSObject, ObservableObject {
             config.showsCursor = showCursor
 
             let image = try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: config)
-            let png = try await Task.detached { try Screenshot.pngData(image, scale: scale) }.value
-
-            var savedURL: URL?
-            if saveScreenshot {
-                savedURL = try Screenshot.save(png)
-                lastScreenshotURL = savedURL
-            }
-            if copyScreenshot {
-                Screenshot.copy(png, image: image, scale: scale)
-            }
             Screenshot.playSound()
-            let screen = NSScreen.screens.first { $0.frame.contains(NSEvent.mouseLocation) } ?? NSScreen.main
-            if let screen {
-                screenshotPreview.show(image, fileURL: savedURL, on: screen)
+            logger.info("Screenshot \(image.width)×\(image.height)")
+
+            let fallbackScreen = NSScreen.screens.first { $0.frame.contains(NSEvent.mouseLocation) } ?? NSScreen.main ?? NSScreen.screens[0]
+            let shot = CapturedShot(image: image, scale: scale,
+                                    placement: placement ?? ScreenPlacement(rect: fallbackScreen.frame, screen: fallbackScreen))
+            if annotateAfterCapture {
+                annotate(shot, savedAt: nil)
+            } else {
+                await deliver(shot, outcome: .save, savedAt: nil)
             }
-            logger.info("Screenshot \(image.width)×\(image.height): \(savedURL?.path ?? "clipboard only", privacy: .public)")
         } catch {
             logger.error("Screenshot failed: \(String(describing: error), privacy: .public)")
             errorMessage = "Couldn’t take the screenshot: \(error.localizedDescription)"
         }
+    }
+
+    /// Opens the annotation tools on the shot where it was taken. `savedAt` is the file it was
+    /// already saved to (when annotating from the thumbnail), which Save then overwrites.
+    private func annotate(_ shot: CapturedShot, savedAt existingURL: URL?) {
+        screenshotPreview.hide()
+        annotationOverlay.present(
+            image: shot.image, scale: shot.scale, at: shot.placement.rect, on: shot.placement.screen,
+            saveTitle: saveScreenshot ? "Save" : "Copy", showsCopy: saveScreenshot
+        ) { [weak self] outcome, result in
+            var annotated = shot
+            annotated.image = result
+            Task { await self?.deliver(annotated, outcome: outcome, savedAt: existingURL) }
+        }
+    }
+
+    /// Saves and/or copies the shot as the settings say (Copy only copies), then shows the thumbnail.
+    private func deliver(_ shot: CapturedShot, outcome: AnnotationOverlay.Outcome, savedAt existingURL: URL?) async {
+        guard outcome != .discard else { return }
+        do {
+            let (image, scale) = (shot.image, shot.scale)
+            let png = try await Task.detached { try Screenshot.pngData(image, scale: scale) }.value
+            var savedURL = existingURL
+            if outcome == .save && saveScreenshot {
+                if let existingURL {
+                    try png.write(to: existingURL, options: .atomic)
+                } else {
+                    savedURL = try Screenshot.save(png, in: screenshotFolder)
+                }
+                lastScreenshotURL = savedURL
+            }
+            if outcome == .copy || copyScreenshot || !saveScreenshot {
+                Screenshot.copy(png, image: image, scale: scale)
+            }
+            screenshotPreview.show(image, fileURL: savedURL, on: shot.placement.screen) { [weak self] in
+                self?.annotate(shot, savedAt: savedURL)
+            }
+            logger.info("Screenshot delivered: \(savedURL?.path ?? "clipboard only", privacy: .public)")
+        } catch {
+            logger.error("Saving screenshot failed: \(String(describing: error), privacy: .public)")
+            errorMessage = "Couldn’t save the screenshot: \(error.localizedDescription)"
+        }
+    }
+
+    /// Lets the user pick another folder for screenshots.
+    func chooseScreenshotFolder() {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.canCreateDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.directoryURL = screenshotFolder
+        panel.prompt = "Use This Folder"
+        panel.message = "Choose where screenshots are saved"
+        NSApp.activate()
+        if panel.runModal() == .OK, let url = panel.url {
+            screenshotFolder = url
+        }
+    }
+
+    func resetScreenshotFolder() {
+        screenshotFolder = Screenshot.defaultFolder
+    }
+
+    /// The folder for the menu, e.g. "~/Pictures/ScreenRecorder".
+    var screenshotFolderName: String {
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        let path = screenshotFolder.path
+        return path.hasPrefix(home) ? "~" + path.dropFirst(home.count) : path
     }
 
     /// All of our own windows, including the camera bubble, stay out of screenshots.
@@ -913,8 +1012,8 @@ final class Recorder: NSObject, ObservableObject {
     }
 
     func openScreenshotsFolder() {
-        try? FileManager.default.createDirectory(at: Screenshot.folder, withIntermediateDirectories: true)
-        NSWorkspace.shared.open(Screenshot.folder)
+        try? FileManager.default.createDirectory(at: screenshotFolder, withIntermediateDirectories: true)
+        NSWorkspace.shared.open(screenshotFolder)
     }
 
     func openScreenRecordingSettings() {

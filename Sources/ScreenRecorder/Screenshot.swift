@@ -5,7 +5,8 @@ import UniformTypeIdentifiers
 
 /// Saving, copying and announcing a captured screenshot.
 enum Screenshot {
-    static let folder = FileManager.default
+    /// Where screenshots go unless another folder is chosen in the menu.
+    static let defaultFolder = FileManager.default
         .urls(for: .picturesDirectory, in: .userDomainMask)[0]
         .appendingPathComponent("ScreenRecorder", isDirectory: true)
 
@@ -24,7 +25,7 @@ enum Screenshot {
         return data as Data
     }
 
-    static func save(_ png: Data) throws -> URL {
+    static func save(_ png: Data, in folder: URL) throws -> URL {
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
         let formatter = DateFormatter()
         formatter.dateFormat = "yyyy-MM-dd 'at' HH.mm.ss"
@@ -68,8 +69,8 @@ enum ScreenshotError: LocalizedError {
 
 // MARK: - Preview thumbnail
 
-/// A thumbnail in the corner of the screen after a capture, like macOS's own: click it to open
-/// the file, drag it into another app, or let it slide away after a few seconds.
+/// A thumbnail in the corner of the screen after a capture, like macOS's own: click it to
+/// annotate, drag it into another app, or let it fade away after a few seconds.
 @MainActor
 final class ScreenshotPreview {
     private var panel: NSPanel?
@@ -79,7 +80,7 @@ final class ScreenshotPreview {
     private static let maxSize = CGSize(width: 240, height: 170)
     private static let visibleFor: Duration = .seconds(6)
 
-    func show(_ image: CGImage, fileURL: URL?, on screen: NSScreen) {
+    func show(_ image: CGImage, fileURL: URL?, on screen: NSScreen, onAnnotate: @escaping () -> Void) {
         dismissTask?.cancel()
         panel?.orderOut(nil)
 
@@ -89,6 +90,10 @@ final class ScreenshotPreview {
             image: NSImage(cgImage: image, size: thumbnail),
             size: thumbnail,
             fileURL: fileURL,
+            onAnnotate: { [weak self] in
+                self?.hide()
+                onAnnotate()
+            },
             onOpen: { [weak self] in
                 if let fileURL { NSWorkspace.shared.open(fileURL) }
                 self?.hide()
@@ -151,6 +156,7 @@ private struct ScreenshotPreviewView: View {
     let image: NSImage
     let size: CGSize
     let fileURL: URL?
+    let onAnnotate: () -> Void
     let onOpen: () -> Void
     let onClose: () -> Void
     let onHover: (Bool) -> Void
@@ -164,29 +170,52 @@ private struct ScreenshotPreviewView: View {
                 .clipShape(RoundedRectangle(cornerRadius: 8))
                 .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(.white.opacity(0.9), lineWidth: 2))
                 .contentShape(Rectangle())
-                .onTapGesture(perform: onOpen)
+                .onTapGesture(perform: onAnnotate)
                 .onDrag {
                     if let fileURL, let provider = NSItemProvider(contentsOf: fileURL) { return provider }
                     return NSItemProvider(object: image)
                 }
-                .help(fileURL == nil ? "Copied to the clipboard · Drag into another app" : "Click to open · Drag into another app")
+                .help("Click to annotate · Drag into another app")
 
             if hovering {
-                Button(action: onClose) {
-                    Image(systemName: "xmark")
-                        .font(.system(size: 10, weight: .bold))
-                        .frame(width: 22, height: 22)
-                        .background(.black.opacity(0.7), in: Circle())
-                        .foregroundStyle(.white)
+                HStack {
+                    roundButton("xmark", help: "Close", action: onClose)
+                    Spacer()
+                    if fileURL != nil {
+                        roundButton("arrow.up.forward.app", help: "Open in Preview", action: onOpen)
+                    }
                 }
-                .buttonStyle(.plain)
                 .padding(6)
+                .frame(width: size.width)
+
+                Label("Annotate", systemImage: "pencil.tip.crop.circle")
+                    .font(.system(size: 11, weight: .semibold))
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 4)
+                    .background(.black.opacity(0.7), in: Capsule())
+                    .foregroundStyle(.white)
+                    .allowsHitTesting(false)
+                    .frame(width: size.width, height: size.height, alignment: .bottom)
+                    .padding(.bottom, 8)
             }
         }
         .padding(6)
+        .frame(width: size.width + 12, height: size.height + 12)
         .onHover { inside in
             hovering = inside
             onHover(inside)
         }
+    }
+
+    private func roundButton(_ symbol: String, help: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(systemName: symbol)
+                .font(.system(size: 10, weight: .bold))
+                .frame(width: 22, height: 22)
+                .background(.black.opacity(0.7), in: Circle())
+                .foregroundStyle(.white)
+        }
+        .buttonStyle(.plain)
+        .help(help)
     }
 }
