@@ -132,6 +132,19 @@ struct MenuView: View {
                 }
             }
 
+            ActionButton(
+                title: startButtonTitle,
+                subtitle: startButtonSubtitle,
+                symbol: startButtonSymbol,
+                tint: recorder.mode.tint
+            ) {
+                Task {
+                    if isScreenshotMode { await recorder.takeScreenshot() } else { await recorder.start() }
+                }
+            }
+            .disabled(recorder.isBusy || needsWindow)
+            .keyboardShortcut(.defaultAction)
+
             sourcePicker
 
             if isScreenshotMode {
@@ -139,20 +152,6 @@ struct MenuView: View {
             } else {
                 videoSettings
             }
-
-            Button {
-                Task {
-                    if isScreenshotMode { await recorder.takeScreenshot() } else { await recorder.start() }
-                }
-            } label: {
-                Label(startButtonTitle, systemImage: isScreenshotMode ? "camera.fill" : "record.circle.fill")
-                    .frame(maxWidth: .infinity)
-            }
-            .controlSize(.large)
-            .buttonStyle(.borderedProminent)
-            .tint(recorder.mode.tint)
-            .disabled(recorder.isBusy || needsWindow)
-            .keyboardShortcut(.defaultAction)
         }
     }
 
@@ -271,6 +270,25 @@ struct MenuView: View {
 
     private var needsWindow: Bool {
         recorder.source == .window && recorder.selectedWindowID == nil
+    }
+
+    private var startButtonSubtitle: String {
+        if recorder.isBusy { return "" }
+        if needsWindow { return "Pick one from the list below" }
+        switch (recorder.source, isScreenshotMode) {
+        case (.area, false): return "Pick a window or area, then record"
+        case (.area, true): return "Click a window or drag an area"
+        case (.display, false): return recorder.useCountdown ? "Whole screen, after a 3 s countdown" : "Records the whole screen"
+        case (.display, true): return "Captures the whole screen"
+        case (.window, false): return "Records the selected window"
+        case (.window, true): return "Captures the selected window"
+        }
+    }
+
+    private var startButtonSymbol: String {
+        if needsWindow { return "macwindow" }
+        if recorder.source == .area { return "rectangle.dashed" }
+        return isScreenshotMode ? "camera.fill" : "record.circle.fill"
     }
 
     private var startButtonTitle: String {
@@ -486,5 +504,79 @@ private struct IconTile: View {
         .help(help)
         .accessibilityLabel(title)
         .accessibilityAddTraits(isSelected ? .isSelected : [])
+    }
+}
+
+/// The big "go" button under the source tiles: a gradient card in the mode's color with an
+/// icon, a line saying what will happen, and the Return-key hint.
+private struct ActionButton: View {
+    let title: String
+    let subtitle: String
+    let symbol: String
+    let tint: Color
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 12) {
+                ZStack {
+                    Circle()
+                        .fill(.white.opacity(0.22))
+                        .frame(width: 36, height: 36)
+                    Image(systemName: symbol)
+                        .font(.system(size: 17, weight: .bold))
+                        .contentTransition(.symbolEffect(.replace))
+                }
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(title)
+                        .font(.system(size: 15, weight: .semibold))
+                    if !subtitle.isEmpty {
+                        Text(subtitle)
+                            .font(.system(size: 11))
+                            .opacity(0.85)
+                            .lineLimit(1)
+                            .minimumScaleFactor(0.85)
+                    }
+                }
+                Spacer(minLength: 4)
+                Image(systemName: "return")
+                    .font(.system(size: 11, weight: .bold))
+                    .padding(.horizontal, 7)
+                    .padding(.vertical, 4)
+                    .background(.white.opacity(0.2), in: Capsule())
+                    .help("Press Return")
+            }
+            .padding(.horizontal, 12)
+            .frame(maxWidth: .infinity, minHeight: 58)
+        }
+        .buttonStyle(ActionButtonStyle(tint: tint))
+    }
+}
+
+private struct ActionButtonStyle: ButtonStyle {
+    let tint: Color
+    @Environment(\.isEnabled) private var isEnabled
+    @State private var isHovering = false
+
+    func makeBody(configuration: Configuration) -> some View {
+        let shape = RoundedRectangle(cornerRadius: 14, style: .continuous)
+        let color = isEnabled ? tint : Color.gray
+        return configuration.label
+            .foregroundStyle(.white)
+            .background {
+                shape.fill(LinearGradient(colors: [color.opacity(0.95), color.opacity(0.72)],
+                                          startPoint: .topLeading, endPoint: .bottomTrailing))
+            }
+            // A light edge along the top, like glass.
+            .overlay(shape.strokeBorder(LinearGradient(colors: [.white.opacity(0.45), .white.opacity(0.05)],
+                                                       startPoint: .top, endPoint: .bottom), lineWidth: 1))
+            .shadow(color: isEnabled ? tint.opacity(isHovering ? 0.55 : 0.4) : .clear, radius: isHovering ? 12 : 8, y: 4)
+            .brightness(configuration.isPressed ? -0.06 : (isHovering && isEnabled ? 0.04 : 0))
+            .scaleEffect(configuration.isPressed ? 0.98 : (isHovering && isEnabled ? 1.01 : 1))
+            .opacity(isEnabled ? 1 : 0.6)
+            .contentShape(shape)
+            .onHover { isHovering = $0 }
+            .animation(.snappy(duration: 0.15), value: isHovering)
+            .animation(.snappy(duration: 0.1), value: configuration.isPressed)
     }
 }

@@ -29,6 +29,7 @@ rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$BIN_DIR/$APP_NAME" "$APP/Contents/MacOS/$APP_NAME"
 cp Resources/Info.plist "$APP/Contents/Info.plist"
+cp Resources/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
 
 codesign --force --sign "$IDENTITY" --identifier com.aelhomsany.ScreenRecorder "$APP"
 echo "Built $APP (signed with: $IDENTITY)"

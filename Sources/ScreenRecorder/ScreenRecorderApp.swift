@@ -22,24 +22,28 @@ private struct MenuBarLabel: View {
         switch recorder.state {
         case .recording:
             HStack(spacing: 4) {
-                Image(systemName: "stop.circle.fill")
+                icon(.recording)
                 Text(recorder.elapsedText).monospacedDigit()
             }
         case .paused:
             HStack(spacing: 4) {
-                Image(systemName: "pause.circle.fill")
+                icon(.paused)
                 Text(recorder.elapsedText).monospacedDigit()
             }
         case .selectingArea:
-            Image(systemName: "rectangle.dashed")
+            icon(.selecting(recorder.mode))
         case .countingDown:
-            Image(systemName: "\(recorder.countdownValue).circle.fill")
+            icon(.countdown(recorder.countdownValue, recorder.mode))
         case .capturing:
-            Image(systemName: "camera.fill")
+            icon(.capturing)
         case .starting, .stopping:
-            Image(systemName: "hourglass")
+            icon(.busy)
         case .idle:
-            Image(systemName: "record.circle")
+            icon(.idle)
         }
+    }
+
+    private func icon(_ badge: MenuBarIcon.Badge) -> some View {
+        Image(nsImage: MenuBarIcon.image(badge)).renderingMode(.original)
     }
 }

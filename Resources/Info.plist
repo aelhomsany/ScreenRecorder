@@ -12,6 +12,8 @@
     <string>ScreenRecorder</string>
     <key>CFBundleDisplayName</key>
     <string>Screen Recorder</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
