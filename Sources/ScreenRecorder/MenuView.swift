@@ -20,8 +20,8 @@ struct MenuView: View {
                 errorBanner(message)
             }
 
-            if let url = recorder.lastRecordingURL, recorder.state == .idle {
-                lastRecording(url)
+            if recorder.state == .idle, let url = isScreenshotMode ? recorder.lastScreenshotURL : recorder.lastRecordingURL {
+                lastCapture(url)
             }
 
             Divider()
@@ -32,7 +32,7 @@ struct MenuView: View {
         .task { await recorder.refreshSources() }
         .onChange(of: recorder.state) { _, newState in
             // Get the panel out of the way once area selection, the countdown or recording begins.
-            if [.selectingArea, .countingDown, .recording].contains(newState) { dismiss() }
+            if [.selectingArea, .countingDown, .recording, .capturing].contains(newState) { dismiss() }
         }
     }
 
@@ -44,10 +44,10 @@ struct MenuView: View {
                 .foregroundStyle(.red)
             Text("Screen Recorder").font(.headline)
             Spacer()
-            Text("⌃⌥⌘R  ·  Area ⌃⌥⌘A")
+            Text(isScreenshotMode ? "Screenshot ⌃⌥⌘S" : "⌃⌥⌘R  ·  Area ⌃⌥⌘A")
                 .font(.caption)
                 .foregroundStyle(.secondary)
-                .help("⌃⌥⌘R starts or stops recording. ⌃⌥⌘A selects an area to record. ⌃⌥⌘P pauses or resumes.")
+                .help("⌃⌥⌘R starts or stops recording. ⌃⌥⌘A selects an area to record. ⌃⌥⌘P pauses or resumes. ⌃⌥⌘S takes a screenshot of a window or area.")
         }
     }
 
@@ -113,14 +113,66 @@ struct MenuView: View {
 
     private var settingsSection: some View {
         VStack(alignment: .leading, spacing: 10) {
-            Picker("Record", selection: $recorder.source) {
-                ForEach(CaptureSource.allCases) { Text($0.title).tag($0) }
+            HStack(spacing: 10) {
+                ForEach(CaptureMode.allCases) { mode in
+                    IconTile(symbol: mode.symbol, title: mode.title, subtitle: mode.subtitle, tint: mode.tint,
+                             isSelected: recorder.mode == mode, help: mode.help) {
+                        withAnimation(.snappy(duration: 0.2)) { recorder.mode = mode }
+                    }
+                }
             }
-            .pickerStyle(.segmented)
-            .labelsHidden()
+
+            // What to capture. The selected one takes the mode's color, so the two rows read together.
+            HStack(spacing: 8) {
+                ForEach(CaptureSource.allCases) { source in
+                    IconTile(symbol: source.symbol, title: source.title, subtitle: source.subtitle, tint: recorder.mode.tint,
+                             isSelected: recorder.source == source, compact: true, help: source.help) {
+                        withAnimation(.snappy(duration: 0.2)) { recorder.source = source }
+                    }
+                }
+            }
 
             sourcePicker
 
+            if isScreenshotMode {
+                screenshotSettings
+            } else {
+                videoSettings
+            }
+
+            Button {
+                Task {
+                    if isScreenshotMode { await recorder.takeScreenshot() } else { await recorder.start() }
+                }
+            } label: {
+                Label(startButtonTitle, systemImage: isScreenshotMode ? "camera.fill" : "record.circle.fill")
+                    .frame(maxWidth: .infinity)
+            }
+            .controlSize(.large)
+            .buttonStyle(.borderedProminent)
+            .tint(isScreenshotMode ? .accentColor : .red)
+            .disabled(recorder.isBusy || needsWindow)
+            .keyboardShortcut(.defaultAction)
+        }
+    }
+
+    private var screenshotSettings: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Toggle("Show mouse cursor", isOn: $recorder.showCursor)
+            Picker("Delay", selection: $recorder.screenshotDelay) {
+                Text("None").tag(0)
+                Text("3 seconds").tag(3)
+                Text("5 seconds").tag(5)
+                Text("10 seconds").tag(10)
+            }
+            .help("Time to open a menu or hover something before the screenshot is taken.")
+            Toggle("Save to Pictures › ScreenRecorder", isOn: $recorder.saveScreenshot)
+            Toggle("Copy to clipboard", isOn: $recorder.copyScreenshot)
+        }
+    }
+
+    private var videoSettings: some View {
+        VStack(alignment: .leading, spacing: 10) {
             Toggle("System audio", isOn: $recorder.captureSystemAudio)
             Toggle("Microphone", isOn: $recorder.captureMicrophone)
             Toggle("Show mouse cursor", isOn: $recorder.showCursor)
@@ -149,18 +201,6 @@ struct MenuView: View {
 
             Toggle("3-second countdown", isOn: $recorder.useCountdown)
             Toggle("Show in Finder when done", isOn: $recorder.revealWhenDone)
-
-            Button {
-                Task { await recorder.start() }
-            } label: {
-                Label(startButtonTitle, systemImage: "record.circle.fill")
-                    .frame(maxWidth: .infinity)
-            }
-            .controlSize(.large)
-            .buttonStyle(.borderedProminent)
-            .tint(.red)
-            .disabled(recorder.isBusy || needsWindow)
-            .keyboardShortcut(.defaultAction)
         }
     }
 
@@ -199,15 +239,17 @@ struct MenuView: View {
         .padding(.leading, 20)
     }
 
+    private var isScreenshotMode: Bool { recorder.mode == .screenshot }
+
     private var needsWindow: Bool {
         recorder.source == .window && recorder.selectedWindowID == nil
     }
 
     private var startButtonTitle: String {
-        if recorder.isBusy { return "Starting…" }
+        if recorder.isBusy { return isScreenshotMode ? "Capturing…" : "Starting…" }
         if needsWindow { return "Choose a Window First" }
         if recorder.source == .area { return "Select Area…" }
-        return "Start Recording"
+        return isScreenshotMode ? "Take Screenshot" : "Start Recording"
     }
 
     @ViewBuilder
@@ -238,22 +280,29 @@ struct MenuView: View {
             }
         case .area:
             VStack(alignment: .leading, spacing: 6) {
-                Toggle(isOn: $recorder.reuseLastArea) {
-                    HStack(spacing: 4) {
-                        Text("Start from the last area")
-                        if let area = recorder.selectedArea {
-                            Text("\(Int(area.rect.width)) × \(Int(area.rect.height))")
-                                .monospacedDigit()
-                                .foregroundStyle(.secondary)
+                if isScreenshotMode {
+                    Text("Click a window, popup or part of a window to capture it, or drag any area.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                } else {
+                    Toggle(isOn: $recorder.reuseLastArea) {
+                        HStack(spacing: 4) {
+                            Text("Start from the last area")
+                            if let area = recorder.selectedArea {
+                                Text("\(Int(area.rect.width)) × \(Int(area.rect.height))")
+                                    .monospacedDigit()
+                                    .foregroundStyle(.secondary)
+                            }
                         }
                     }
+                    .disabled(recorder.selectedArea == nil)
+                    Text(recorder.reuseLastArea && recorder.selectedArea != nil
+                         ? "Adjust it, or click a window to pick that instead."
+                         : "Click a window or popup to pick it, or drag any area.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                 }
-                .disabled(recorder.selectedArea == nil)
-                Text(recorder.reuseLastArea && recorder.selectedArea != nil
-                     ? "Adjust it, or click a window to pick that instead."
-                     : "Click a window or popup to pick it, or drag any area.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
                 Toggle("Detect parts of windows", isOn: $recorder.detectElements)
                     .help("Highlights sidebars, toolbars, panes and other parts of a window. Scroll to step between bigger and smaller parts.")
                 if recorder.detectElements && !ElementDetector.isTrusted {
@@ -282,9 +331,9 @@ struct MenuView: View {
         }
     }
 
-    private func lastRecording(_ url: URL) -> some View {
+    private func lastCapture(_ url: URL) -> some View {
         HStack {
-            Image(systemName: "film")
+            Image(systemName: isScreenshotMode ? "photo" : "film")
             Text(url.lastPathComponent)
                 .font(.callout)
                 .lineLimit(1)
@@ -304,11 +353,110 @@ struct MenuView: View {
 
     private var footer: some View {
         HStack {
-            Button("Recordings Folder") { recorder.openRecordingsFolder() }
+            if isScreenshotMode {
+                Button("Screenshots Folder") { recorder.openScreenshotsFolder() }
+            } else {
+                Button("Recordings Folder") { recorder.openRecordingsFolder() }
+            }
             Spacer()
             Button("Quit") { NSApp.terminate(nil) }
                 .keyboardShortcut("q")
         }
         .buttonStyle(.borderless)
+    }
+}
+
+extension CaptureMode {
+    var symbol: String { self == .video ? "video.fill" : "camera.viewfinder" }
+    var subtitle: String { self == .video ? "Record screen & sound" : "Capture a still image" }
+    var tint: Color { self == .video ? .red : .blue }
+    var help: String {
+        self == .video
+            ? "Record a video of your screen, a window or an area"
+            : "Take a screenshot of your screen, a window or an area (⌃⌥⌘S)"
+    }
+}
+
+extension CaptureSource {
+    var symbol: String {
+        switch self {
+        case .display: "display"
+        case .window: "macwindow"
+        case .area: "rectangle.dashed"
+        }
+    }
+
+    var subtitle: String {
+        switch self {
+        case .display: "Whole display"
+        case .window: "One window"
+        case .area: "Pick a region"
+        }
+    }
+
+    var help: String {
+        switch self {
+        case .display: "Capture everything on one display"
+        case .window: "Capture a single window, even when it's covered by others"
+        case .area: "Click a window or part of one, or drag out any area"
+        }
+    }
+}
+
+/// A big, colorful button with an icon and a line saying what it does. Used for the mode
+/// (Video / Screenshot) and, `compact`, for the source (Screen / Window / Area).
+private struct IconTile: View {
+    let symbol: String
+    let title: String
+    let subtitle: String
+    let tint: Color
+    let isSelected: Bool
+    var compact = false
+    let help: String
+    let action: () -> Void
+    @State private var isHovering = false
+
+    var body: some View {
+        Button(action: action) {
+            VStack(spacing: compact ? 4 : 6) {
+                ZStack {
+                    Circle()
+                        .fill(isSelected ? AnyShapeStyle(tint.gradient) : AnyShapeStyle(tint.opacity(0.14)))
+                        .frame(width: compact ? 36 : 46, height: compact ? 36 : 46)
+                        .shadow(color: isSelected ? tint.opacity(0.45) : .clear, radius: 6, y: 2)
+                    Image(systemName: symbol)
+                        .font(.system(size: compact ? 16 : 20, weight: .semibold))
+                        .foregroundStyle(isSelected ? .white : tint)
+                        .symbolEffect(.bounce, value: isSelected)
+                }
+                Text(title)
+                    .font(.system(size: compact ? 12 : 13, weight: .semibold))
+                    .foregroundStyle(isSelected ? .primary : .secondary)
+                Text(subtitle)
+                    .font(.system(size: 10))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.8)
+            }
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, compact ? 8 : 10)
+            .padding(.horizontal, 4)
+            .background(
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .fill(isSelected ? tint.opacity(0.12) : Color.primary.opacity(isHovering ? 0.07 : 0.04))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .strokeBorder(isSelected ? tint : Color.primary.opacity(0.1), lineWidth: isSelected ? 2 : 1)
+            )
+            .contentShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+            .scaleEffect(isHovering && !isSelected ? 1.02 : 1)
+        }
+        .buttonStyle(.plain)
+        .onHover { isHovering = $0 }
+        .animation(.snappy(duration: 0.15), value: isHovering)
+        .help(help)
+        .accessibilityLabel(title)
+        .accessibilityAddTraits(isSelected ? .isSelected : [])
     }
 }

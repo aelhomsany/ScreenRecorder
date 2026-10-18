@@ -17,6 +17,18 @@ enum CaptureSource: String, CaseIterable, Identifiable {
     }
 }
 
+enum CaptureMode: String, CaseIterable, Identifiable {
+    case video, screenshot
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .video: "Video"
+        case .screenshot: "Screenshot"
+        }
+    }
+}
+
 enum RecorderError: LocalizedError {
     case noDisplay, noWindow, areaDisplayMissing
 
@@ -35,7 +47,7 @@ private let logger = Logger(subsystem: "com.aelhomsany.ScreenRecorder", category
 /// which encodes HEVC/H.264 at a bitrate suited to screen content.
 @MainActor
 final class Recorder: NSObject, ObservableObject {
-    enum State { case idle, selectingArea, countingDown, starting, recording, paused, stopping }
+    enum State { case idle, selectingArea, countingDown, starting, recording, paused, stopping, capturing }
 
     @Published private(set) var state: State = .idle
     @Published private(set) var countdownValue = 0
@@ -43,6 +55,7 @@ final class Recorder: NSObject, ObservableObject {
     @Published private(set) var displays: [SCDisplay] = []
     @Published private(set) var windows: [SCWindow] = []
     @Published private(set) var lastRecordingURL: URL?
+    @Published private(set) var lastScreenshotURL: URL?
     @Published var errorMessage: String?
 
     @Published var selectedDisplayID: CGDirectDisplayID?
@@ -50,6 +63,7 @@ final class Recorder: NSObject, ObservableObject {
     @Published private(set) var selectedArea: AreaSelection? { didSet { saveArea() } }
 
     // Persisted settings.
+    @Published var mode: CaptureMode { didSet { defaults.set(mode.rawValue, forKey: "mode") } }
     @Published var source: CaptureSource { didSet { defaults.set(source.rawValue, forKey: "source") } }
     @Published var captureSystemAudio: Bool { didSet { defaults.set(captureSystemAudio, forKey: "systemAudio") } }
     @Published var captureMicrophone: Bool { didSet { defaults.set(captureMicrophone, forKey: "microphone") } }
@@ -62,6 +76,21 @@ final class Recorder: NSObject, ObservableObject {
     @Published var compatibleFormat: Bool { didSet { defaults.set(compatibleFormat, forKey: "compatibleFormat") } }
     /// Open the area picker with the last area already selected (otherwise it starts empty).
     @Published var reuseLastArea: Bool { didSet { defaults.set(reuseLastArea, forKey: "reuseLastArea") } }
+    // Screenshots: saved to a file, copied to the clipboard, or both (never neither).
+    @Published var saveScreenshot: Bool {
+        didSet {
+            defaults.set(saveScreenshot, forKey: "saveScreenshot")
+            if !saveScreenshot && !copyScreenshot { copyScreenshot = true }
+        }
+    }
+    @Published var copyScreenshot: Bool {
+        didSet {
+            defaults.set(copyScreenshot, forKey: "copyScreenshot")
+            if !copyScreenshot && !saveScreenshot { saveScreenshot = true }
+        }
+    }
+    /// Seconds to wait before capturing, so menus and hover states can be set up.
+    @Published var screenshotDelay: Int { didSet { defaults.set(screenshotDelay, forKey: "screenshotDelay") } }
     /// Highlight parts of windows (sidebars, toolbars…) in the area picker. Needs Accessibility access.
     @Published var detectElements: Bool {
         didSet {
@@ -105,6 +134,7 @@ final class Recorder: NSObject, ObservableObject {
     private let areaSelector = AreaSelector()
     private let areaBorder = AreaBorderOverlay()
     private let cameraBubble = CameraBubble()
+    private let screenshotPreview = ScreenshotPreview()
 
     static let recordingsFolder = FileManager.default
         .urls(for: .moviesDirectory, in: .userDomainMask)[0]
@@ -112,7 +142,8 @@ final class Recorder: NSObject, ObservableObject {
 
     override init() {
         defaults.register(defaults: [
-            "source": CaptureSource.display.rawValue,
+            "mode": CaptureMode.video.rawValue,
+            "source": CaptureSource.area.rawValue,
             "systemAudio": true,
             "microphone": false,
             "showCursor": true,
@@ -123,8 +154,12 @@ final class Recorder: NSObject, ObservableObject {
             "compatibleFormat": false,
             "reuseLastArea": true,
             "detectElements": true,
+            "saveScreenshot": true,
+            "copyScreenshot": true,
+            "screenshotDelay": 0,
         ])
-        source = CaptureSource(rawValue: defaults.string(forKey: "source") ?? "") ?? .display
+        mode = CaptureMode(rawValue: defaults.string(forKey: "mode") ?? "") ?? .video
+        source = CaptureSource(rawValue: defaults.string(forKey: "source") ?? "") ?? .area
         captureSystemAudio = defaults.bool(forKey: "systemAudio")
         captureMicrophone = defaults.bool(forKey: "microphone")
         showCursor = defaults.bool(forKey: "showCursor")
@@ -135,6 +170,10 @@ final class Recorder: NSObject, ObservableObject {
         compatibleFormat = defaults.bool(forKey: "compatibleFormat")
         reuseLastArea = defaults.bool(forKey: "reuseLastArea")
         detectElements = defaults.bool(forKey: "detectElements")
+        let saveScreenshot = defaults.bool(forKey: "saveScreenshot")
+        self.saveScreenshot = saveScreenshot
+        copyScreenshot = defaults.bool(forKey: "copyScreenshot") || !saveScreenshot
+        screenshotDelay = defaults.integer(forKey: "screenshotDelay")
         selectedArea = Self.loadArea(from: defaults)
         cameraID = defaults.string(forKey: "cameraID")
         bubbleSize = CameraBubble.Size(rawValue: defaults.integer(forKey: "bubbleSize")) ?? .medium
@@ -147,6 +186,7 @@ final class Recorder: NSObject, ObservableObject {
         //   ⌃⌥⌘R  start / stop with the current mode
         //   ⌃⌥⌘A  select an area and record it
         //   ⌃⌥⌘P  pause / resume
+        //   ⌃⌥⌘S  screenshot: click a window or part, or drag an area
         let modifiers = UInt32(controlKey | optionKey | cmdKey)
         hotKeys = [
             HotKey(id: 1, keyCode: UInt32(kVK_ANSI_R), modifiers: modifiers) { [weak self] in
@@ -166,6 +206,12 @@ final class Recorder: NSObject, ObservableObject {
                 MainActor.assumeIsolated {
                     guard let self else { return }
                     Task { await self.togglePause() }
+                }
+            },
+            HotKey(id: 4, keyCode: UInt32(kVK_ANSI_S), modifiers: modifiers) { [weak self] in
+                MainActor.assumeIsolated {
+                    guard let self else { return }
+                    Task { await self.takeScreenshot(pickArea: true) }
                 }
             },
         ].compactMap { $0 }
@@ -312,7 +358,7 @@ final class Recorder: NSObject, ObservableObject {
         case .idle: await start()
         case .countingDown: cancelCountdown()
         case .recording, .paused: await stop()
-        case .selectingArea, .starting, .stopping: break
+        case .selectingArea, .starting, .stopping, .capturing: break
         }
     }
 
@@ -328,11 +374,7 @@ final class Recorder: NSObject, ObservableObject {
         guard state == .idle else { return }
         errorMessage = nil
 
-        guard CGPreflightScreenCaptureAccess() else {
-            CGRequestScreenCaptureAccess()
-            errorMessage = "Screen Recording permission is needed. Turn on Screen Recorder in System Settings → Privacy & Security → Screen & System Audio Recording, then quit and reopen the app."
-            return
-        }
+        guard checkScreenCaptureAccess() else { return }
 
         // Area mode always shows the picker (optionally with the last area pre-selected), so you can
         // see exactly what will be recorded and confirm it with Return or the Record button.
@@ -353,7 +395,7 @@ final class Recorder: NSObject, ObservableObject {
         }
 
         if useCountdown {
-            guard await runCountdown() else { return }
+            guard await runCountdown(seconds: 3, centeredAt: countdownCenter()) else { return }
         }
 
         state = .starting
@@ -564,13 +606,12 @@ final class Recorder: NSObject, ObservableObject {
         state = .idle
     }
 
-    /// Shows 3‑2‑1 over what's about to be recorded. Returns false if it was cancelled.
-    private func runCountdown() async -> Bool {
+    /// Shows 3‑2‑1 over what's about to be captured. Returns false if it was cancelled.
+    private func runCountdown(seconds: Int, centeredAt center: NSPoint) async -> Bool {
         state = .countingDown
-        let center = countdownCenter()
         defer { countdownOverlay.hide() }
 
-        for value in stride(from: 3, through: 1, by: -1) {
+        for value in stride(from: seconds, through: 1, by: -1) {
             countdownValue = value
             countdownOverlay.show(value, centeredAt: center)
             // Sleep in short slices so cancelling feels instant.
@@ -761,11 +802,119 @@ final class Recorder: NSObject, ObservableObject {
         elapsedText = h > 0 ? String(format: "%d:%02d:%02d", h, m, s) : String(format: "%02d:%02d", m, s)
     }
 
+    // MARK: - Screenshots
+
+    /// Captures the current source (Screen, Window or Area) as a PNG. `pickArea` always opens the
+    /// picker instead, where a click takes a window or part of one and a drag takes any area.
+    func takeScreenshot(pickArea: Bool = false) async {
+        guard state == .idle else { return }
+        errorMessage = nil
+        guard checkScreenCaptureAccess() else { return }
+
+        let source: CaptureSource = pickArea ? .area : self.source
+        var area: AreaSelection?
+        if source == .area {
+            state = .selectingArea
+            area = await areaSelector.select(initial: nil, detectElements: detectElements, purpose: .screenshot)
+            state = .idle
+            guard area != nil else { return }
+        }
+
+        if screenshotDelay > 0 {
+            let center: NSPoint
+            if let area, let screen = Self.screen(for: area.displayID) {
+                let rect = screen.globalRect(fromLocal: area.rect)
+                center = NSPoint(x: rect.midX, y: rect.midY)
+            } else {
+                center = countdownCenter()
+            }
+            guard await runCountdown(seconds: screenshotDelay, centeredAt: center) else { return }
+        }
+
+        state = .capturing
+        defer { state = .idle }
+        // Let the menu panel or picker finish disappearing (and the menu bar icon un-highlight).
+        try? await Task.sleep(for: .milliseconds(150))
+
+        do {
+            let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
+            let filter: SCContentFilter
+            let config = SCStreamConfiguration()
+            let size: CGSize
+            switch source {
+            case .display:
+                guard let display = content.displays.first(where: { $0.displayID == selectedDisplayID })
+                    ?? content.displays.first else { throw RecorderError.noDisplay }
+                filter = SCContentFilter(display: display, excludingApplications: ownApps(in: content), exceptingWindows: [])
+                size = filter.contentRect.size
+            case .window:
+                guard let id = selectedWindowID,
+                      let window = content.windows.first(where: { $0.windowID == id }) else { throw RecorderError.noWindow }
+                filter = SCContentFilter(desktopIndependentWindow: window)
+                config.ignoreShadowsSingleWindow = true
+                size = filter.contentRect.size
+            case .area:
+                guard let area, let display = content.displays.first(where: { $0.displayID == area.displayID }) else {
+                    throw RecorderError.areaDisplayMissing
+                }
+                filter = SCContentFilter(display: display, excludingApplications: ownApps(in: content), exceptingWindows: [])
+                let rect = area.rect.intersection(CGRect(origin: .zero, size: filter.contentRect.size))
+                config.sourceRect = rect
+                size = rect.size
+            }
+            let scale = CGFloat(filter.pointPixelScale)
+            config.width = Int((size.width * scale).rounded())
+            config.height = Int((size.height * scale).rounded())
+            config.captureResolution = .best
+            config.showsCursor = showCursor
+
+            let image = try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: config)
+            let png = try await Task.detached { try Screenshot.pngData(image, scale: scale) }.value
+
+            var savedURL: URL?
+            if saveScreenshot {
+                savedURL = try Screenshot.save(png)
+                lastScreenshotURL = savedURL
+            }
+            if copyScreenshot {
+                Screenshot.copy(png, image: image, scale: scale)
+            }
+            Screenshot.playSound()
+            let screen = NSScreen.screens.first { $0.frame.contains(NSEvent.mouseLocation) } ?? NSScreen.main
+            if let screen {
+                screenshotPreview.show(image, fileURL: savedURL, on: screen)
+            }
+            logger.info("Screenshot \(image.width)×\(image.height): \(savedURL?.path ?? "clipboard only", privacy: .public)")
+        } catch {
+            logger.error("Screenshot failed: \(String(describing: error), privacy: .public)")
+            errorMessage = "Couldn’t take the screenshot: \(error.localizedDescription)"
+        }
+    }
+
+    /// All of our own windows, including the camera bubble, stay out of screenshots.
+    private func ownApps(in content: SCShareableContent) -> [SCRunningApplication] {
+        content.applications.filter { $0.bundleIdentifier == Bundle.main.bundleIdentifier }
+    }
+
+    private func checkScreenCaptureAccess() -> Bool {
+        guard CGPreflightScreenCaptureAccess() else {
+            CGRequestScreenCaptureAccess()
+            errorMessage = "Screen Recording permission is needed. Turn on Screen Recorder in System Settings → Privacy & Security → Screen & System Audio Recording, then quit and reopen the app."
+            return false
+        }
+        return true
+    }
+
     // MARK: - Folder helpers
 
     func openRecordingsFolder() {
         try? FileManager.default.createDirectory(at: Self.recordingsFolder, withIntermediateDirectories: true)
         NSWorkspace.shared.open(Self.recordingsFolder)
+    }
+
+    func openScreenshotsFolder() {
+        try? FileManager.default.createDirectory(at: Screenshot.folder, withIntermediateDirectories: true)
+        NSWorkspace.shared.open(Screenshot.folder)
     }
 
     func openScreenRecordingSettings() {

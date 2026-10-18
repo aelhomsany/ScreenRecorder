@@ -34,6 +34,8 @@ private struct MenuBarLabel: View {
             Image(systemName: "rectangle.dashed")
         case .countingDown:
             Image(systemName: "\(recorder.countdownValue).circle.fill")
+        case .capturing:
+            Image(systemName: "camera.fill")
         case .starting, .stopping:
             Image(systemName: "hourglass")
         case .idle:

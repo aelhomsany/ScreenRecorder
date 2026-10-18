@@ -17,8 +17,13 @@ A lightweight macOS menu bar screen recorder built on ScreenCaptureKit (macOS 15
 - Floating control bar while recording (timer, Pause/Resume, Stop, Discard), never captured in the video
 - Pause and resume: each stretch is recorded as its own segment, and the segments are joined
   losslessly into one MP4 when you stop
-- Global hotkeys: **⌃⌥⌘R** start/stop, **⌃⌥⌘A** select an area and record, **⌃⌥⌘P** pause/resume
-- Recordings are saved to `~/Movies/ScreenRecorder`
+- Screenshot mode: capture the screen, a window (even if it's covered) or an area as a Retina PNG.
+  In the picker a single click captures the window, popup or part of a window under the pointer.
+  Optional 3/5/10 s delay, saved to a file and/or copied to the clipboard, with a preview
+  thumbnail you can click to open or drag into another app
+- Global hotkeys: **⌃⌥⌘R** start/stop, **⌃⌥⌘A** select an area and record, **⌃⌥⌘P** pause/resume,
+  **⌃⌥⌘S** screenshot (click a window or drag an area)
+- Recordings are saved to `~/Movies/ScreenRecorder`, screenshots to `~/Pictures/ScreenRecorder`
 
 ## Build & run
 
@@ -51,5 +56,7 @@ After switching identities, reset the old grant once:
 | `Sources/ScreenRecorder/Recorder.swift` | Capture, pause/resume and recording state (SCStream) |
 | `Sources/ScreenRecorder/SegmentWriter.swift` | Encodes each segment to HEVC/H.264 + AAC (AVAssetWriter), quality presets |
 | `Sources/ScreenRecorder/SegmentJoiner.swift` | Joins segments and mixes system audio + mic into one track |
+| `Sources/ScreenRecorder/Screenshot.swift` | Saving/copying screenshots and the preview thumbnail |
+| `Sources/ScreenRecorder/AreaSelector.swift` | The area / window / element picker |
 | `Sources/ScreenRecorder/HotKey.swift` | Global hotkey (Carbon) |
 | `Resources/Info.plist` | Bundle config (menu bar only, mic usage text) |

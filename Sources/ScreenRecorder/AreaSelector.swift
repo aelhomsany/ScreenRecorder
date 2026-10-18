@@ -30,6 +30,11 @@ struct DetectedRegion: Equatable {
     var app = ""
 }
 
+/// What the picked area is for. Screenshots take a plain click as final, so picking a window is one click.
+enum PickerPurpose {
+    case record, screenshot
+}
+
 /// Dims every screen and lets the user pick a window or popup with a click, or drag out a
 /// rectangle, then adjust it (move / resize) and confirm with the floating Record button or Return.
 /// Esc cancels.
@@ -41,7 +46,7 @@ final class AreaSelector {
 
     /// `initial` pre-selects a previous area so it can be reused with a single Return.
     /// `detectElements` also highlights parts of windows (needs Accessibility access).
-    func select(initial: AreaSelection?, detectElements: Bool) async -> AreaSelection? {
+    func select(initial: AreaSelection?, detectElements: Bool, purpose: PickerPurpose = .record) async -> AreaSelection? {
         await withCheckedContinuation { continuation in
             self.continuation = continuation
             // Snapshot what's on screen before our overlay goes up.
@@ -49,7 +54,7 @@ final class AreaSelector {
             let detector = detectElements && ElementDetector.isTrusted ? ElementDetector() : nil
             windows = NSScreen.screens.compactMap { screen in
                 guard let displayID = screen.displayID else { return nil }
-                let window = SelectionWindow(screen: screen, displayID: displayID, selector: self)
+                let window = SelectionWindow(screen: screen, displayID: displayID, purpose: purpose, selector: self)
                 window.selectionView.setCandidates(
                     Self.regions(onScreen, on: displayID),
                     elements: detector,
@@ -170,9 +175,9 @@ private final class SelectionWindow: NSPanel {
     let displayID: CGDirectDisplayID
     let selectionView: SelectionView
 
-    init(screen: NSScreen, displayID: CGDirectDisplayID, selector: AreaSelector) {
+    init(screen: NSScreen, displayID: CGDirectDisplayID, purpose: PickerPurpose, selector: AreaSelector) {
         self.displayID = displayID
-        selectionView = SelectionView(displayID: displayID, selector: selector)
+        selectionView = SelectionView(displayID: displayID, purpose: purpose, selector: selector)
         super.init(contentRect: screen.frame, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
         setFrame(screen.frame, display: false)
         level = .screenSaver
@@ -229,6 +234,7 @@ private final class SelectionView: NSView {
     private static let gripThickness: CGFloat = 6
 
     private let displayID: CGDirectDisplayID
+    private let purpose: PickerPurpose
     private weak var selector: AreaSelector?
     private var selection: CGRect?
     private var drag: Drag?
@@ -255,13 +261,15 @@ private final class SelectionView: NSView {
     private let toolbarModel = SelectionToolbarModel()
     private var toolbar: NSHostingView<SelectionToolbar>!
 
-    init(displayID: CGDirectDisplayID, selector: AreaSelector) {
+    init(displayID: CGDirectDisplayID, purpose: PickerPurpose, selector: AreaSelector) {
         self.displayID = displayID
+        self.purpose = purpose
         self.selector = selector
         super.init(frame: .zero)
 
         toolbar = NSHostingView(rootView: SelectionToolbar(
             model: toolbarModel,
+            purpose: purpose,
             onCancel: { [weak self] in self?.selector?.finish(nil) },
             onRecord: { [weak self] in self?.confirm() }
         ))
@@ -492,9 +500,15 @@ private final class SelectionView: NSView {
         let wasCreating = isCreating
         drag = nil
         // A click or a tiny drag selects the window under the pointer instead of leaving a sliver.
-        selection = validSelection ?? (wasCreating ? clickCandidate?.rect : nil)
+        let clicked = wasCreating && validSelection == nil ? clickCandidate : nil
+        selection = validSelection ?? clicked?.rect
         clickCandidate = nil
         selectionChanged()
+        // For a screenshot, clicking a window or part is the whole job.
+        if purpose == .screenshot, clicked != nil {
+            confirm()
+            return
+        }
         updateHover(at: convert(event.locationInWindow, from: nil))
     }
 
@@ -627,7 +641,8 @@ private final class SelectionView: NSView {
         var name = region.name
         if name.count > 60 { name = String(name.prefix(57)) + "…" }
         let scrollHint = chain.count > 1 ? "  ·  Scroll for bigger/smaller" : ""
-        let label = "\(name)  ·  \(Int(rect.width)) × \(Int(rect.height))  ·  Click to select\(scrollHint)"
+        let click = purpose == .screenshot ? "Click to capture" : "Click to select"
+        let label = "\(name)  ·  \(Int(rect.width)) × \(Int(rect.height))  ·  \(click)\(scrollHint)"
         let y = rect.height > 120 ? rect.minY + 28 : rect.midY
         drawLabel(label, centeredAt: CGPoint(x: rect.midX, y: y), fontSize: 12)
     }
@@ -741,13 +756,15 @@ private final class SelectionView: NSView {
     /// How-to line near the top of the screen (or the bottom, if the selection is up there).
     private func drawHint(avoiding rect: CGRect?) {
         guard let rect else {
+            let click = purpose == .screenshot ? "Click a window or popup to capture it" : "Click a window or popup to select it"
             drawLabel(
-                "Click a window or popup to select it  ·  Or drag to select any area  ·  Esc to cancel",
+                "\(click)  ·  Or drag to select any area  ·  Esc to cancel",
                 centeredAt: CGPoint(x: bounds.midX, y: 60), fontSize: 13
             )
             return
         }
-        let text = "Drag inside to move  ·  Drag edges to resize  ·  Click a window or drag outside for a new area  ·  Return to record"
+        let action = purpose == .screenshot ? "capture" : "record"
+        let text = "Drag inside to move  ·  Drag edges to resize  ·  Click a window or drag outside for a new area  ·  Return to \(action)"
         let topY: CGFloat = 60
         let bottomY = bounds.maxY - 40
         let y: CGFloat
@@ -784,6 +801,7 @@ private final class SelectionToolbarModel: ObservableObject {
 
 private struct SelectionToolbar: View {
     @ObservedObject var model: SelectionToolbarModel
+    let purpose: PickerPurpose
     let onCancel: () -> Void
     let onRecord: () -> Void
 
@@ -804,15 +822,15 @@ private struct SelectionToolbar: View {
                 .foregroundStyle(.secondary)
 
             Button(action: onRecord) {
-                Label("Record", systemImage: "record.circle.fill")
+                Label(isScreenshot ? "Capture" : "Record", systemImage: isScreenshot ? "camera.fill" : "record.circle.fill")
                     .font(.system(size: 13, weight: .semibold))
                     .padding(.horizontal, 12)
                     .padding(.vertical, 5)
-                    .background(.red, in: Capsule())
+                    .background(isScreenshot ? Color.accentColor : .red, in: Capsule())
                     .foregroundStyle(.white)
             }
             .buttonStyle(.plain)
-            .help("Start recording (Return)")
+            .help(isScreenshot ? "Take the screenshot (Return)" : "Start recording (Return)")
         }
         .padding(.leading, 8)
         .padding(.trailing, 6)
@@ -821,6 +839,8 @@ private struct SelectionToolbar: View {
         .environment(\.colorScheme, .dark)
         .fixedSize()
     }
+
+    private var isScreenshot: Bool { purpose == .screenshot }
 }
 
 // MARK: - Border while recording
