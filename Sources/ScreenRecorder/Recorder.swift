@@ -31,8 +31,8 @@ enum RecorderError: LocalizedError {
 
 private let logger = Logger(subsystem: "com.aelhomsany.ScreenRecorder", category: "recording")
 
-/// Owns the ScreenCaptureKit stream and writes it to disk with SCRecordingOutput,
-/// which handles H.264 encoding and muxing video, system audio and microphone into one MP4.
+/// Owns the ScreenCaptureKit stream and writes it to disk with SegmentWriter (AVAssetWriter),
+/// which encodes HEVC/H.264 at a bitrate suited to screen content.
 @MainActor
 final class Recorder: NSObject, ObservableObject {
     enum State { case idle, selectingArea, countingDown, starting, recording, paused, stopping }
@@ -57,6 +57,9 @@ final class Recorder: NSObject, ObservableObject {
     @Published var framesPerSecond: Int { didSet { defaults.set(framesPerSecond, forKey: "fps") } }
     @Published var useCountdown: Bool { didSet { defaults.set(useCountdown, forKey: "countdown") } }
     @Published var revealWhenDone: Bool { didSet { defaults.set(revealWhenDone, forKey: "revealWhenDone") } }
+    @Published var quality: VideoQuality { didSet { defaults.set(quality.rawValue, forKey: "quality") } }
+    /// H.264 instead of HEVC: plays on older PCs and devices, but files are ~50% bigger.
+    @Published var compatibleFormat: Bool { didSet { defaults.set(compatibleFormat, forKey: "compatibleFormat") } }
     /// Open the area picker with the last area already selected (otherwise it starts empty).
     @Published var reuseLastArea: Bool { didSet { defaults.set(reuseLastArea, forKey: "reuseLastArea") } }
     /// Highlight parts of windows (sidebars, toolbars…) in the area picker. Needs Accessibility access.
@@ -79,10 +82,8 @@ final class Recorder: NSObject, ObservableObject {
 
     // The segment being written right now. Pausing ends it; resuming starts a new one.
     private var stream: SCStream?
-    private var recordingOutput: SCRecordingOutput?
-    private var currentURL: URL?
-    private var recordingFinished = false
-    private var recordingError: Error?
+    private var writer: SegmentWriter?
+    private var captureStopped = false
 
     // The whole recording, across pauses.
     private var outputURL: URL?
@@ -104,8 +105,6 @@ final class Recorder: NSObject, ObservableObject {
     private let areaSelector = AreaSelector()
     private let areaBorder = AreaBorderOverlay()
     private let cameraBubble = CameraBubble()
-    private let sink = NullStreamOutput()
-    private let sinkQueue = DispatchQueue(label: "ScreenRecorder.samples")
 
     static let recordingsFolder = FileManager.default
         .urls(for: .moviesDirectory, in: .userDomainMask)[0]
@@ -120,6 +119,8 @@ final class Recorder: NSObject, ObservableObject {
             "fps": 60,
             "countdown": true,
             "revealWhenDone": true,
+            "quality": VideoQuality.balanced.rawValue,
+            "compatibleFormat": false,
             "reuseLastArea": true,
             "detectElements": true,
         ])
@@ -130,6 +131,8 @@ final class Recorder: NSObject, ObservableObject {
         framesPerSecond = defaults.integer(forKey: "fps")
         useCountdown = defaults.bool(forKey: "countdown")
         revealWhenDone = defaults.bool(forKey: "revealWhenDone")
+        quality = VideoQuality(rawValue: defaults.string(forKey: "quality") ?? "") ?? .balanced
+        compatibleFormat = defaults.bool(forKey: "compatibleFormat")
         reuseLastArea = defaults.bool(forKey: "reuseLastArea")
         detectElements = defaults.bool(forKey: "detectElements")
         selectedArea = Self.loadArea(from: defaults)
@@ -169,6 +172,29 @@ final class Recorder: NSObject, ObservableObject {
     }
 
     var isBusy: Bool { ![.idle, .recording, .paused].contains(state) }
+
+    /// Rough upper bound on file size for the menu, for what's selected now.
+    /// A still screen uses much less, since only changes are encoded.
+    var estimatedMegabytesPerMinute: Int? {
+        let points: CGSize
+        let scale: CGFloat
+        switch source {
+        case .display:
+            guard let screen = selectedDisplayID.flatMap(Self.screen(for:)) ?? NSScreen.main else { return nil }
+            (points, scale) = (screen.frame.size, screen.backingScaleFactor)
+        case .area:
+            guard let area = selectedArea, let screen = Self.screen(for: area.displayID) else { return nil }
+            (points, scale) = (area.rect.size, screen.backingScaleFactor)
+        case .window:
+            guard let window = windows.first(where: { $0.windowID == selectedWindowID }) else { return nil }
+            (points, scale) = (window.frame.size, NSScreen.main?.backingScaleFactor ?? 2)
+        }
+        let size = Self.outputSize(points: points, scale: scale)
+        let video = quality.bitrate(width: size.width, height: size.height, fps: framesPerSecond,
+                                    codec: compatibleFormat ? .h264 : .hevc)
+        let audio = 160_000
+        return max(1, Int((Double(video + audio) * 60 / 8 / 1_000_000).rounded()))
+    }
 
     // MARK: - Sources
 
@@ -437,72 +463,74 @@ final class Recorder: NSObject, ObservableObject {
         config.height = size.height
         config.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale(framesPerSecond))
         config.queueDepth = 6
+        // YUV 4:2:0 is what the encoder takes, so frames go straight in without a conversion.
+        config.pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+        config.colorMatrix = kCVImageBufferYCbCrMatrix_ITU_R_709_2
+        config.colorSpaceName = CGColorSpace.sRGB
         config.showsCursor = showCursor
         config.capturesAudio = captureSystemAudio
+        config.sampleRate = 48_000
+        config.channelCount = 2
         config.excludesCurrentProcessAudio = true
         config.captureMicrophone = usesMicrophone
         config.ignoreShadowsSingleWindow = true
 
         let url = workFolder.appendingPathComponent("part-\(nextSegmentNumber).mp4")
         nextSegmentNumber += 1
-        let outputConfig = SCRecordingOutputConfiguration()
-        outputConfig.outputURL = url
-        outputConfig.outputFileType = .mp4
-        outputConfig.videoCodecType = .h264
-        let recordingOutput = SCRecordingOutput(configuration: outputConfig, delegate: self)
+        let writer = try SegmentWriter(
+            url: url, width: size.width, height: size.height, fps: framesPerSecond,
+            quality: quality, preferHEVC: !compatibleFormat,
+            systemAudio: captureSystemAudio, microphone: usesMicrophone
+        )
 
         let stream = SCStream(filter: filter, configuration: config, delegate: self)
-        // SCRecordingOutput does the writing; these no-op outputs just keep
-        // ScreenCaptureKit from logging "stream output not found" for every frame.
-        try stream.addStreamOutput(sink, type: .screen, sampleHandlerQueue: sinkQueue)
-        if config.capturesAudio {
-            try stream.addStreamOutput(sink, type: .audio, sampleHandlerQueue: sinkQueue)
-        }
-        if usesMicrophone {
-            try stream.addStreamOutput(sink, type: .microphone, sampleHandlerQueue: sinkQueue)
-        }
-        try stream.addRecordingOutput(recordingOutput)
-
-        self.stream = stream
-        self.recordingOutput = recordingOutput
-        self.currentURL = url
-        self.recordingFinished = false
-        self.recordingError = nil
         do {
+            try stream.addStreamOutput(writer, type: .screen, sampleHandlerQueue: writer.queue)
+            if config.capturesAudio {
+                try stream.addStreamOutput(writer, type: .audio, sampleHandlerQueue: writer.queue)
+            }
+            if usesMicrophone {
+                try stream.addStreamOutput(writer, type: .microphone, sampleHandlerQueue: writer.queue)
+            }
+            self.stream = stream
+            self.writer = writer
             try await stream.startCapture()
         } catch {
             self.stream = nil
-            self.recordingOutput = nil
-            self.currentURL = nil
-            try? FileManager.default.removeItem(at: url)
+            self.writer = nil
+            writer.cancel()
             throw error
         }
+        logger.info("Segment \(url.lastPathComponent, privacy: .public): \(size.width)×\(size.height) @ \(self.framesPerSecond) fps, \(writer.codec == .hevc ? "HEVC" : "H.264", privacy: .public) \(self.quality.rawValue, privacy: .public)")
         return captureRect
     }
 
     /// Finishes the segment being written (if any) and adds it to `segments`.
     private func finalizeSegment() async {
-        guard let stream else { return }
-        if let recordingOutput {
-            try? stream.removeRecordingOutput(recordingOutput)
-        }
-        // Removing the recording output finalizes the file, and macOS then tears the stream down
-        // ("connection interrupted"). When that happens stopCapture() can hang forever, so fire it
-        // off without awaiting and only wait (with a timeout) for the file to be finished.
-        Task { try? await stream.stopCapture() }
-        await waitForRecordingToFinish()
-
-        if let url = currentURL {
-            if Self.fileSize(of: url) > 0 {
-                segments.append(url)
-            } else if let recordingError {
-                failureError = recordingError
-            }
-        }
+        guard let stream, let writer else { return }
+        // Clear these first so late delegate callbacks from this stream are ignored.
         self.stream = nil
-        recordingOutput = nil
-        currentURL = nil
-        recordingError = nil
+        self.writer = nil
+
+        let endTime = CMClockGetTime(CMClockGetHostTimeClock())
+        await stopCapture(stream)
+        if await writer.finish(at: endTime) {
+            segments.append(writer.url)
+        } else if let error = writer.error {
+            failureError = error
+        }
+    }
+
+    /// stopCapture() can hang if macOS has already torn the stream down, so wait at most 2 seconds.
+    private func stopCapture(_ stream: SCStream) async {
+        captureStopped = false
+        Task {
+            try? await stream.stopCapture()
+            captureStopped = true
+        }
+        for _ in 0..<40 where !captureStopped {
+            try? await Task.sleep(for: .milliseconds(50))
+        }
     }
 
     private func waitForSegmentSwitch() async {
@@ -623,12 +651,6 @@ final class Recorder: NSObject, ObservableObject {
         }
     }
 
-    private func waitForRecordingToFinish() async {
-        for _ in 0..<50 where !recordingFinished {
-            try? await Task.sleep(for: .milliseconds(100))
-        }
-    }
-
     private static func fileSize(of url: URL) -> Int {
         (try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? Int) ?? 0
     }
@@ -694,9 +716,8 @@ final class Recorder: NSObject, ObservableObject {
         timer = nil
         segmentStartDate = nil
         stream = nil
-        recordingOutput = nil
-        currentURL = nil
-        recordingError = nil
+        writer?.cancel()
+        writer = nil
         if let workFolder {
             try? FileManager.default.removeItem(at: workFolder)
         }
@@ -754,19 +775,15 @@ final class Recorder: NSObject, ObservableObject {
     }
 
     // Delegate callbacks can arrive late, after a pause has already moved on to a new
-    // segment, so they're only acted on if they belong to the current stream/output.
+    // segment, so they're only acted on if they belong to the current stream.
     fileprivate func isCurrent(stream id: ObjectIdentifier) -> Bool {
         stream.map(ObjectIdentifier.init) == id
-    }
-
-    fileprivate func isCurrent(output id: ObjectIdentifier) -> Bool {
-        recordingOutput.map(ObjectIdentifier.init) == id
     }
 }
 
 // MARK: - ScreenCaptureKit delegates
 
-extension Recorder: SCStreamDelegate, SCRecordingOutputDelegate {
+extension Recorder: SCStreamDelegate {
     nonisolated func stream(_ stream: SCStream, didStopWithError error: Error) {
         logger.notice("Stream stopped: \(String(describing: error), privacy: .public)")
         // Fires when capture ends without us asking: the window closed, the display
@@ -784,26 +801,4 @@ extension Recorder: SCStreamDelegate, SCRecordingOutputDelegate {
             await self.finishRecording()
         }
     }
-
-    nonisolated func recordingOutputDidFinishRecording(_ recordingOutput: SCRecordingOutput) {
-        let id = ObjectIdentifier(recordingOutput)
-        Task { @MainActor in
-            guard self.isCurrent(output: id) else { return }
-            self.recordingFinished = true
-        }
-    }
-
-    nonisolated func recordingOutput(_ recordingOutput: SCRecordingOutput, didFailWithError error: Error) {
-        logger.notice("Recording output reported: \(String(describing: error), privacy: .public)")
-        let id = ObjectIdentifier(recordingOutput)
-        Task { @MainActor in
-            guard self.isCurrent(output: id) else { return }
-            self.recordingError = error
-            self.recordingFinished = true
-        }
-    }
-}
-
-private final class NullStreamOutput: NSObject, SCStreamOutput {
-    func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of type: SCStreamOutputType) {}
 }

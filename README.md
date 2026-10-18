@@ -5,8 +5,10 @@ A lightweight macOS menu bar screen recorder built on ScreenCaptureKit (macOS 15
 - Record the entire screen (any display), a single window, or a dragged-out area
 - 3-second on-screen countdown (cancel with ⌃⌥⌘R)
 - Draggable round webcam bubble (S/M/L, any camera incl. Continuity Camera), recorded in Screen and Area modes
-- System audio and microphone, mixed into one MP4 (H.264 + AAC)
-- 30 or 60 fps, at native resolution (scaled down to fit inside H.264's 4096×2304 limit)
+- System audio and microphone, mixed into one audio track
+- HEVC (or H.264 for compatibility) at a bitrate tuned for screen content, with Smaller /
+  Balanced / High quality: roughly 1/2 to 1/4 the size of macOS's built-in recording output
+- 30 or 60 fps, at native resolution (scaled down to fit inside 4096×2304)
 - Area picker: hover highlights the window or popup under the pointer (click to pick it), or drag
   any area; move/resize handles, arrow-key nudging, a floating Record button, and an option to
   start from the last area
@@ -46,6 +48,8 @@ After switching identities, reset the old grant once:
 |------|---------|
 | `Sources/ScreenRecorder/ScreenRecorderApp.swift` | App entry point and menu bar icon |
 | `Sources/ScreenRecorder/MenuView.swift` | The menu bar panel UI |
-| `Sources/ScreenRecorder/Recorder.swift` | Capture and recording logic (SCStream + SCRecordingOutput) |
+| `Sources/ScreenRecorder/Recorder.swift` | Capture, pause/resume and recording state (SCStream) |
+| `Sources/ScreenRecorder/SegmentWriter.swift` | Encodes each segment to HEVC/H.264 + AAC (AVAssetWriter), quality presets |
+| `Sources/ScreenRecorder/SegmentJoiner.swift` | Joins segments and mixes system audio + mic into one track |
 | `Sources/ScreenRecorder/HotKey.swift` | Global hotkey (Carbon) |
 | `Resources/Info.plist` | Bundle config (menu bar only, mic usage text) |

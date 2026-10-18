@@ -134,6 +134,19 @@ struct MenuView: View {
                 Text("60 fps").tag(60)
             }
 
+            VStack(alignment: .leading, spacing: 4) {
+                Picker("Quality", selection: $recorder.quality) {
+                    ForEach(VideoQuality.allCases) { Text($0.title).tag($0) }
+                }
+                if let megabytes = recorder.estimatedMegabytesPerMinute {
+                    Text("Up to about \(megabytes) MB per minute, less when the screen is still.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            Toggle("Compatible format (H.264)", isOn: $recorder.compatibleFormat)
+                .help("Plays on older PCs and devices, but files are about 50% bigger. Off uses HEVC, which plays on any Mac, iPhone and current browsers.")
+
             Toggle("3-second countdown", isOn: $recorder.useCountdown)
             Toggle("Show in Finder when done", isOn: $recorder.revealWhenDone)
 
